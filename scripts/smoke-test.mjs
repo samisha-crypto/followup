@@ -20,6 +20,7 @@ let r;
 console.log('Auth');
 r = await anon.req('GET', '/api/me'); ok(r.s === 401, 'anonymous cannot read /api/me');
 r = await anon.req('GET', '/api/c/todos'); ok(r.s === 401, 'anonymous cannot read data');
+r = await anon.req('GET', '/'); ok(r.s === 200 && typeof r.j === 'string' && r.j.includes('function checkinsHtml()') && r.j.includes('data-act="ciDiscuss"') && r.j.includes('data-act="ciQuestion"') && r.j.includes('data-act="ciEdit"') && r.j.includes('data-act="writeTool"'), 'generated UI includes editable check-ins, question answers and rich-text composers');
 r = await admin.req('POST', '/api/signup', { name: 'Alice Admin', email: 'alice@x.io', password: 'password123' }); ok(r.s === 200, 'first signup works (becomes admin)');
 r = await admin.req('GET', '/api/me'); ok(r.j.owner === true && r.j.name === 'Alice Admin', 'first user is owner');
 r = await bob.req('POST', '/api/signup', { name: 'Bob Member', email: 'bob@x.io', password: 'password123' }); ok(r.s === 403, 'signup without invite code is refused');
@@ -50,7 +51,10 @@ r = await admin.req('POST', '/api/c/projects', { name: 'Admin secret', access: [
 r = await bob.req('GET', '/api/c/projects'); ok(r.j.length === 1 && r.j[0].name === 'Bob private', 'member sees only own project');
 r = await admin.req('GET', '/api/c/projects'); ok(r.j.length === 2, 'admin sees every project');
 r = await bob.req('POST', '/api/c/todos', { pid: secret, title: 'sneaky', to: 'x' }); ok(r.s === 403, 'member cannot add to-do in a project they cannot see');
-r = await bob.req('POST', '/api/c/todos', { pid: bobProj, title: 'My task', to: 'x', last: Date.now(), log: [] }); const todo = r.j.id; ok(r.s === 200, 'member adds to-do in own project');
+r = await bob.req('POST', '/api/c/todolists', { pid: bobProj, title: 'Work' }); const workList = r.j.id; ok(r.s === 200 && workList, 'member creates a parent to-do list');
+r = await bob.req('POST', '/api/c/todos', { pid: bobProj, title: 'Unparented task', to: 'x' }); ok(r.s === 403, 'server refuses to-dos without a parent list');
+r = await bob.req('POST', '/api/c/todos', { pid: bobProj, listId: workList, title: 'My task', to: 'x', last: Date.now(), log: [] }); const todo = r.j.id; ok(r.s === 200, 'member adds a to-do under its project list');
+r = await bob.req('GET', '/api/c/todos'); ok(r.j.find(t => t.id === todo)?.listId === workList, 'to-do references the parent list by id');
 r = await admin.req('GET', '/api/c/todos'); ok(r.j.some(t => t.id === todo), 'admin sees the to-do');
 r = await cat.req('GET', '/api/c/todos'); ok(r.j.length === 0, 'viewer without access sees nothing');
 r = await cat.req('GET', '/api/c/projects'); ok(r.j.length === 0, 'viewer without access sees no projects');
@@ -61,23 +65,46 @@ r = await bob.req('PATCH', `/api/c/members/${(await bob.req('GET','/api/me')).j.
 r = await bob.req('PATCH', `/api/c/todos/${todo}`, { pid: secret }); ok(r.s === 403, 'cannot move a to-do into a project you cannot see');
 
 console.log('Inbox & DMs');
-const bobId = (await bob.req('GET', '/api/me')).j.id, aliceId = (await admin.req('GET', '/api/me')).j.id;
-r = await admin.req('POST', '/api/c/inbox', { to: bobId, text: 'hello', pid: '', t: Date.now(), read: false }); ok(r.s === 200, 'notification created');
-r = await bob.req('GET', '/api/c/inbox'); ok(r.j.length === 1 && r.j[0].from === aliceId, 'recipient sees it, sender is stamped by server');
+const bobId = (await bob.req('GET', '/api/me')).j.id, aliceId = (await admin.req('GET', '/api/me')).j.id, catId = (await cat.req('GET', '/api/me')).j.id;
+r = await admin.req('POST', '/api/c/inbox', { to: bobId, text: 'hello', pid: '', t: Date.now(), read: false, target: { type: 'todo', id: 'linked-todo', pid: 'project-1' } }); ok(r.s === 200, 'notification created');
+r = await bob.req('GET', '/api/c/inbox'); ok(r.j.length === 1 && r.j[0].from === aliceId && r.j[0].target?.type === 'todo' && r.j[0].target.id === 'linked-todo', 'recipient sees notification target and server-stamped sender');
+const inboxId = r.j[0]?.id;
 r = await cat.req('GET', '/api/c/inbox'); ok(r.j.length === 0, 'others do not see it');
+if (inboxId) {
+  r = await admin.req('PATCH', `/api/c/inbox/${inboxId}`, { read: true }); ok(r.s === 403, 'sender cannot change recipient read state');
+  r = await bob.req('PATCH', `/api/c/inbox/${inboxId}`, { read: true }); ok(r.s === 200, 'recipient can mark inbox message read');
+  r = await bob.req('PATCH', `/api/c/inbox/${inboxId}`, { text: 'altered' }); ok(r.s === 403, 'recipient cannot edit inbox message contents');
+  r = await cat.req('DELETE', `/api/c/inbox/${inboxId}`); ok(r.s === 403, 'non-participant cannot delete inbox message');
+  r = await admin.req('DELETE', `/api/c/inbox/${inboxId}`); ok(r.s === 200, 'sender can delete an inbox message');
+}
 const k = [aliceId, bobId].sort().join('|');
 r = await admin.req('POST', '/api/c/dms', { k, to: bobId, x: 'private', t: Date.now(), seen: false }); ok(r.s === 200, 'DM sent');
+const dmId = r.j.id;
+r = await admin.req('POST', '/api/c/dms', { k: [aliceId, catId].sort().join('|'), to: bobId, x: 'forged recipient' }); ok(r.s === 403, 'DM participant pair must include its recipient');
 r = await cat.req('GET', '/api/c/dms'); ok(r.j.length === 0, 'third party cannot read DMs');
 r = await bob.req('GET', '/api/c/dms'); ok(r.j.length === 1, 'participant reads DM');
+if (dmId) {
+  r = await admin.req('PATCH', `/api/c/dms/${dmId}`, { seen: true }); ok(r.s === 403, 'sender cannot set recipient seen state');
+  r = await bob.req('PATCH', `/api/c/dms/${dmId}`, { seen: true }); ok(r.s === 200, 'recipient can mark DM seen');
+  r = await cat.req('DELETE', `/api/c/dms/${dmId}`); ok(r.s === 403, 'non-participant cannot delete DM');
+  r = await bob.req('DELETE', `/api/c/dms/${dmId}`); ok(r.s === 200, 'participant can delete DM');
+  r = await admin.req('GET', '/api/c/dms'); ok(!r.j.some(x => x.id === dmId), 'deleted DM is no longer visible');
+}
 
 console.log('Project lists & personal preferences');
 r = await bob.req('POST', '/api/c/todolists', { pid: bobProj, title: 'Planning' }); const list = r.j.id; ok(r.s === 200 && list, 'member creates a named to-do list');
 r = await bob.req('GET', '/api/c/todolists'); ok(r.j.some(x => x.id === list && x.title === 'Planning'), 'project list persists');
-const catId = (await cat.req('GET', '/api/me')).j.id;
 r = await cat.req('PATCH', `/api/c/members/${catId}`, { theme: 'light', accent: 'rose' }); ok(r.s === 200, 'viewer can customize their own appearance');
 r = await cat.req('PATCH', `/api/c/members/${catId}`, { theme: 'invalid' }); ok(r.s === 403, 'unsupported theme is rejected');
 
 console.log('Automatic check-ins');
+r = await admin.req('POST', '/api/c/checkins', { pid: bobProj, kind: 'plan', question: 'Weekly update?', recurrence: 'weekly', recipients: [bobId], nextAt: Date.now() + 86400000, timeZone: 'UTC', active: false });
+const editablePlan = r.j.id; ok(r.s === 200 && editablePlan, 'owner creates an inactive check-in plan for edit tests');
+r = await bob.req('PATCH', `/api/c/checkins/${editablePlan}`, { question: 'Unauthorized edit' }); ok(r.s === 403, 'non-owner cannot edit a check-in plan');
+r = await admin.req('PATCH', `/api/c/checkins/${editablePlan}`, { question: 'Updated weekly update?', recurrence: 'daily', daysOfWeek: [1], recipients: [bobId], nextAt: Date.now() + 172800000, timeZone: 'UTC', dayOfMonth: 2 }); ok(r.s === 200, 'owner can edit a check-in question and schedule');
+r = await admin.req('GET', '/api/c/checkins'); const updatedPlan = r.j.find(x => x.id === editablePlan);
+ok(updatedPlan?.question === 'Updated weekly update?' && updatedPlan.recurrence === 'daily' && updatedPlan.active === false, 'edited schedule persists without resuming a paused check-in');
+r = await admin.req('PATCH', `/api/c/checkins/${editablePlan}`, { daysOfWeek: [8] }); ok(r.s === 403, 'invalid schedule edits are rejected');
 r = await admin.req('POST', '/api/c/checkins', { pid: bobProj, kind: 'plan', question: 'What did you finish?', recurrence: 'once', recipients: [bobId], nextAt: Date.now() - 1000, timeZone: 'UTC', active: true });
 const checkinPlan = r.j.id; ok(r.s === 200 && checkinPlan, 'project member schedules a one-time check-in');
 r = await admin.req('POST', '/api/c/checkinRequests', { pid: bobProj, to: bobId, question: 'Forged request' }); ok(r.s === 403, 'clients cannot forge generated check-in requests');
@@ -111,6 +138,31 @@ for (let i = 0; i < 20; i++) {
 }
 const savedDaily = r.j.find(x => x.id === dailyPlan);
 ok(!!savedDaily && savedDaily.nextAt > Date.now(), 'daily schedule advances to its next occurrence');
+r = await admin.req('POST', '/api/c/checkins', { pid: bobProj, kind: 'plan', question: 'Weekday report?', recurrence: 'daily', daysOfWeek: [8], recipients: [bobId], nextAt: Date.now() - 1000, timeZone: 'UTC', active: true });
+ok(r.s === 403, 'check-in weekday selections are range-validated');
+const weekdayStart = Date.now() - 1000, weekday = (new Date(weekdayStart).getUTCDay() + 1) % 7;
+r = await admin.req('POST', '/api/c/checkins', { pid: bobProj, kind: 'plan', question: 'Weekday report?', recurrence: 'daily', daysOfWeek: [weekday], recipients: [bobId], nextAt: weekdayStart, timeZone: 'UTC', active: true });
+const weekdayPlan = r.j.id;
+for (let i = 0; i < 20; i++) {
+  await new Promise(resolve => setTimeout(resolve, 100));
+  r = await admin.req('GET', '/api/c/checkins');
+  const plan = r.j.find(x => x.id === weekdayPlan);
+  if (plan?.nextAt > Date.now()) break;
+}
+const savedWeekday = r.j.find(x => x.id === weekdayPlan);
+ok(!!savedWeekday && new Date(savedWeekday.nextAt).getUTCDay() === weekday, 'daily check-in recurrence skips unselected weekdays');
+const biweeklyStart = Date.now() - 1000;
+r = await admin.req('POST', '/api/c/checkins', { pid: bobProj, kind: 'plan', question: 'Biweekly report?', recurrence: 'biweekly', recipients: [bobId], nextAt: biweeklyStart, timeZone: 'UTC', active: true });
+const biweeklyPlan = r.j.id;
+for (let i = 0; i < 20; i++) {
+  await new Promise(resolve => setTimeout(resolve, 100));
+  r = await admin.req('GET', '/api/c/checkins');
+  const plan = r.j.find(x => x.id === biweeklyPlan);
+  if (plan?.nextAt > Date.now()) break;
+}
+const savedBiweekly = r.j.find(x => x.id === biweeklyPlan);
+const expectedBiweekly = Math.floor(biweeklyStart / 60000) * 60000 + 14 * 86400000;
+ok(!!savedBiweekly && Math.abs(savedBiweekly.nextAt - expectedBiweekly) < 5000, 'every-other-week schedule advances by two weeks');
 
 console.log('Files');
 r = await bob.req('POST', '/api/upload', Buffer.from('hello file'), { 'content-type': 'text/plain', 'x-filename': 'a.txt' }); const fid = r.j.id; ok(r.s === 200 && fid, 'upload works');
@@ -119,6 +171,10 @@ r = await bob.req('POST', '/api/c/chat', { pid: bobProj, x: 'See the attachment'
 r = await cat.req('GET', `/_blob/${fid}`); ok(r.s === 200, 'project members can download an attached file');
 r = await bob.req('POST', '/api/c/inbox', { to: catId, text: 'Private attachment', attachments: [{ aid: fid, name: 'a.txt', size: 10, type: 'text/plain' }] }); ok(r.s === 200, 'private inbox messages accept owned attachments');
 r = await cat.req('GET', `/_blob/${fid}`); ok(r.s === 200, 'inbox recipient can access its attached file');
+r = await bob.req('POST', '/api/c/dms', { k: [bobId, aliceId].sort().join('|'), to: aliceId, attachments: [{ aid: fid, name: 'a.txt', size: 10, type: 'text/plain' }] }); const attachedDmId = r.j.id;
+ok(r.s === 200 && attachedDmId, 'direct messages accept attachment-only sends');
+r = await admin.req('GET', '/api/c/dms'); ok(r.j.some(x => x.id === attachedDmId && x.attachments?.[0]?.aid === fid), 'DM participant can access attached message');
+r = await cat.req('GET', `/_blob/${fid}`); ok(r.s === 200, 'DM participant can download its attached file');
 r = await bob.req('PATCH', `/api/c/members/${bobId}`, { avatar: fid }); ok(r.s === 200, 'users can set their own uploaded picture');
 r = await cat.req('GET', `/api/profiles?ids=${bobId}`); ok(r.j[bobId]?.avatar === fid, 'team profiles expose the picture for mentions');
 r = await admin.req('POST', '/api/upload', Buffer.from('private file'), { 'content-type': 'text/plain', 'x-filename': 'private.txt' }); const privateFid = r.j.id;

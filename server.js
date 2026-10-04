@@ -30,6 +30,24 @@ const putDoc = (c, i, d) => store.putDoc(c, i, d);
 const delDoc = (c, i) => store.deleteDoc(c, i);
 const allDocs = c => store.allDocs(c);
 const strip = ({ id, ...r }) => r;
+async function migrateTodoLists() {
+  const lists = await allDocs('todolists');
+  const todos = await allDocs('todos');
+  for (const todo of todos) {
+    const linked = lists.find(list => list.id === todo.listId && list.pid === todo.pid);
+    if (linked) continue;
+    const title = String(todo.list || 'To-dos').trim() || 'To-dos';
+    let list = lists.find(item => item.pid === todo.pid && String(item.title || '').toLowerCase() === title.toLowerCase());
+    if (!list) {
+      const project = await getDoc('projects', todo.pid);
+      list = { id: nid(), pid: todo.pid, title, by: todo.by || project?.by || 'system', t: todo.created || Date.now() };
+      await putDoc('todolists', list.id, strip(list));
+      lists.push(list);
+    }
+    await putDoc('todos', todo.id, { ...strip(todo), listId: list.id, list: list.title });
+  }
+}
+await migrateTodoLists();
 
 /* ---------- passwords & sessions ---------- */
 const hashPw = pw => { const s = crypto.randomBytes(16); return s.toString('hex') + ':' + crypto.scryptSync(pw, s, 64).toString('hex'); };
@@ -53,6 +71,20 @@ function throttle(req) {
 const roleOf = async uid => { const u = await store.getUser(uid); if (!u) return 'none'; if (u.owner) return 'admin'; return (await getDoc('members', uid))?.role || 'none'; };
 const isWriter = r => r === 'admin' || r === 'member';
 const visibleProjects = async (uid, role) => new Set((await allDocs('projects')).filter(p => role === 'admin' || p.by === uid || (p.access || []).includes(uid)).map(p => p.id));
+async function validCheckinPlan(uid, role, plan) {
+  let zoneOk = false;
+  try { new Intl.DateTimeFormat('en-US', { timeZone: plan.timeZone || 'UTC' }); zoneOk = true; } catch {}
+  const recipients = Array.isArray(plan.recipients) ? [...new Set(plan.recipients)] : [];
+  const validTargets = recipients.length > 0 && recipients.length <= 100 && (await Promise.all(recipients.map(async to => {
+    const targetRole = await roleOf(to);
+    return isWriter(targetRole) && (await visibleProjects(to, targetRole)).has(plan.pid);
+  }))).every(Boolean);
+  const daysOk = plan.daysOfWeek === undefined ||
+    (Array.isArray(plan.daysOfWeek) && plan.daysOfWeek.length <= 7 && plan.daysOfWeek.every(day => Number.isInteger(day) && day >= 0 && day <= 6));
+  return (await visibleProjects(uid, role)).has(plan.pid) && String(plan.question || '').trim().length > 0 &&
+    ['once', 'daily', 'weekly', 'biweekly', 'monthly'].includes(plan.recurrence) && daysOk &&
+    Number.isFinite(plan.nextAt) && plan.nextAt > 0 && zoneOk && validTargets;
+}
 async function readable(col, uid, role) {
   let out = await allDocs(col);
   if (['none', 'pending', 'removed'].includes(role)) return col === 'members' || col === 'settings' ? out.map(d => d.id === uid ? d : { id: d.id, role: d.role, t: d.t }) : [];
@@ -85,12 +117,26 @@ const SELF_KEYS = new Set(['bm', 'snd', 'avatar', 'theme', 'accent']);
 async function allowed(op, col, uid, role, id, cur, data) {
   const w = isWriter(role), adm = role === 'admin', F = 'Forbidden';
   const keys = Object.keys(data || {});
+  if (col === 'todos' && (op === 'create' || data.listId !== undefined)) {
+    if (typeof data.listId !== 'string' || !data.listId) return F;
+    const list = await getDoc('todolists', data.listId);
+    if (!list || list.pid !== (op === 'create' ? data.pid : cur?.pid)) return F;
+  }
   if (op === 'create' && data.attachments !== undefined &&
       (!Array.isArray(data.attachments) || (await Promise.all(data.attachments.map(async a => !a || !/^[a-f0-9]{40}$/.test(a.aid || '') || !(await ownsUpload(uid, a.aid)))).then(rows => rows.some(Boolean))))) return F;
   switch (col) {
-    case 'inbox': return op === 'create' ? (w && data.to ? null : F) : (cur && cur.to === uid && op !== 'put' ? null : F);
-    case 'dms': if (op === 'create') return w && (data.k || '').split('|').includes(uid) && data.to && data.to !== uid ? null : F;
-      return op === 'patch' && cur && cur.to === uid && keys.every(k => k === 'seen') ? null : F;
+    case 'inbox':
+      if (op === 'create') return w && data.to ? null : F;
+      if (op === 'delete') return cur && (cur.to === uid || cur.from === uid) ? null : F;
+      return op === 'patch' && cur?.to === uid && keys.length === 1 && keys[0] === 'read' && typeof data.read === 'boolean' ? null : F;
+    case 'dms':
+      if (op === 'create') {
+        const participants = String(data.k || '').split('|');
+        return w && participants.length === 2 && participants.includes(uid) && participants.includes(data.to) && data.to !== uid ? null : F;
+      }
+      if (!cur || !(cur.k || '').split('|').includes(uid)) return F;
+      if (op === 'delete') return null;
+      return op === 'patch' && cur.to === uid && keys.length === 1 && keys[0] === 'seen' && typeof data.seen === 'boolean' ? null : F;
     case 'members':
       if (adm) return null;
       if (op !== 'patch' || id !== uid || !keys.length || !keys.every(k => SELF_KEYS.has(k))) return F;
@@ -102,19 +148,17 @@ async function allowed(op, col, uid, role, id, cur, data) {
     case 'settings': case 'invites': case 'preusers': return adm ? null : F;
     case 'checkins':
       if (op === 'create' && data.kind === 'plan') {
-        let zoneOk = false;
-        try { new Intl.DateTimeFormat('en-US', { timeZone: data.timeZone || 'UTC' }); zoneOk = true; } catch {}
-        const recipients = Array.isArray(data.recipients) ? [...new Set(data.recipients)] : [];
-        const validTargets = recipients.length > 0 && recipients.length <= 100 && (await Promise.all(recipients.map(async to => {
-          const targetRole = await roleOf(to);
-          return isWriter(targetRole) && (await visibleProjects(to, targetRole)).has(data.pid);
-        }))).every(Boolean);
-        return w && (await visibleProjects(uid, role)).has(data.pid) && String(data.question || '').trim().length > 0 &&
-          ['once', 'daily', 'weekly', 'monthly'].includes(data.recurrence) && Number.isFinite(data.nextAt) &&
-          data.nextAt > 0 && zoneOk && validTargets ? null : F;
+        return w && await validCheckinPlan(uid, role, data) ? null : F;
       }
-      if (cur?.kind === 'plan' && !adm && cur.by !== uid) return F;
-      break;
+      if (cur?.kind === 'plan') {
+        if (!adm && cur.by !== uid) return F;
+        if (op === 'patch' && keys.every(key => key === 'active')) return typeof data.active === 'boolean' ? null : F;
+        const editable = new Set(['question', 'recurrence', 'daysOfWeek', 'recipients', 'nextAt', 'timeZone', 'dayOfMonth']);
+        if (op !== 'patch' || !keys.length || !keys.every(key => editable.has(key)) ||
+            !(await validCheckinPlan(uid, role, { ...cur, ...data }))) return F;
+        return null;
+      }
+      return F;
     case 'checkinRequests':
       return op === 'patch' && cur?.to === uid && keys.length > 0 && keys.every(k => ['answered', 'answeredAt'].includes(k)) ? null : F;
     case 'checkinAnswers':
@@ -172,14 +216,21 @@ try {
 if (env.SMTP_URL) { try { mailer = (await import('nodemailer')).default.createTransport(env.SMTP_URL); } catch (e) { console.warn('email disabled:', e.message); } }
 async function external(n) {
   const u = await store.getUser(n.to); if (!u) return;
+  const target = n.target || {}, deepLink = new URL(BASE || 'http://localhost/');
+  if (target.type) deepLink.searchParams.set('targetType', target.type);
+  if (target.id) deepLink.searchParams.set('targetId', target.id);
+  if (target.pid || n.pid) deepLink.searchParams.set('pid', target.pid || n.pid);
+  if (target.peer) deepLink.searchParams.set('peer', target.peer);
+  if (target.answerId) deepLink.searchParams.set('answerId', target.answerId);
+  const notificationUrl = BASE ? deepLink.toString() : deepLink.pathname + deepLink.search;
   if (webpush) for (const r of await store.listPush(u.id)) {
-    try { await webpush.sendNotification(JSON.parse(r.sub), JSON.stringify({ title: APP, body: n.text, url: BASE || '/' })); }
+    try { await webpush.sendNotification(JSON.parse(r.sub), JSON.stringify({ title: APP, body: n.text, url: notificationUrl })); }
     catch (e) { if ([404, 410].includes(e.statusCode)) await store.deletePush(r.endpoint); }
   }
   if (mailer && env.EMAIL_NOTIFS !== '0') mailer.sendMail({ from: env.MAIL_FROM || `${APP} <no-reply@localhost>`, to: u.email, subject: `[${APP}] ${String(n.text).slice(0, 80)}`, text: `${n.text}\n\nOpen ${APP}: ${BASE || ''}` }).catch(() => {});
 }
-async function inbox(to, text, pid = '', from = 'system', k = 'note') {
-  const n = { to, from, k, text: String(text).slice(0, 200), pid, t: Date.now(), read: false };
+async function inbox(to, text, pid = '', from = 'system', k = 'note', target = null) {
+  const n = { to, from, k, text: String(text).slice(0, 200), pid, target, t: Date.now(), read: false };
   await putDoc('inbox', nid(), n); broadcast('inbox'); await external(n);
 }
 
@@ -202,8 +253,13 @@ function nextCheckinTime(plan, epoch) {
   try { parts = zonedParts(epoch, plan.timeZone || 'UTC'); }
   catch (e) { app.log.warn({ timeZone: plan.timeZone }, 'Invalid check-in time zone; using UTC'); parts = zonedParts(epoch, 'UTC'); }
   const day = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
-  if (plan.recurrence === 'daily') day.setUTCDate(day.getUTCDate() + 1);
+  if (plan.recurrence === 'daily') {
+    day.setUTCDate(day.getUTCDate() + 1);
+    const weekdays = Array.isArray(plan.daysOfWeek) && plan.daysOfWeek.length ? new Set(plan.daysOfWeek) : null;
+    for (let i = 0; weekdays && i < 7 && !weekdays.has(day.getUTCDay()); i++) day.setUTCDate(day.getUTCDate() + 1);
+  }
   else if (plan.recurrence === 'weekly') day.setUTCDate(day.getUTCDate() + 7);
+  else if (plan.recurrence === 'biweekly') day.setUTCDate(day.getUTCDate() + 14);
   else if (plan.recurrence === 'monthly') {
     const wantedDay = plan.dayOfMonth || parts.day;
     day.setUTCDate(1);
@@ -227,7 +283,7 @@ async function sweepCheckins() {
         const id = crypto.createHash('sha256').update(`${plan.id}:${to}:${nextAt}`).digest('hex').slice(0, 40);
         if (!(await getDoc('checkinRequests', id))) {
           await putDoc('checkinRequests', id, { kind: 'request', pid: plan.pid, planId: plan.id, question: plan.question, to, scheduledAt: nextAt, answered: false, t: now });
-          await inbox(to, `Check-in requested: ${plan.question}`, plan.pid, 'system', 'checkin');
+          await inbox(to, `Check-in requested: ${plan.question}`, plan.pid, 'system', 'checkin', { type: 'checkinRequest', id, pid: plan.pid });
           createdRequests = true;
         }
       }
@@ -418,8 +474,8 @@ app.post('/api/c/:col', async (req, reply) => {
   const e = await allowed('create', col, req.uid, role, null, null, d); if (e) return bad(reply, e, 403);
   if (col === 'projects' || SCOPED.has(col)) d.by = req.uid;
   if (col === 'checkinAnswers' || col === 'checkinComments') d.t = Date.now();
-  if (col === 'inbox') { if (!(await store.getUser(d.to))) return { id: 'none' }; d.from = req.uid; }
-  if (col === 'dms') d.from = req.uid;
+  if (col === 'inbox') { if (!(await store.getUser(d.to))) return bad(reply, 'Recipient not found', 404); d.from = req.uid; d.read = false; d.t = Date.now(); }
+  if (col === 'dms') { if (!(await store.getUser(d.to))) return bad(reply, 'Recipient not found', 404); d.from = req.uid; d.seen = false; d.t = Date.now(); }
   const id = nid(); await putDoc(col, id, d); broadcast(col); if (col === 'inbox') await external(d);
   if (col === 'checkins' && d.kind === 'plan') setTimeout(() => sweepCheckins().catch(e => app.log.error(e)), 0);
   return { id };
@@ -447,8 +503,8 @@ app.get('/api/stream', (req, reply) => {
   if (!need(req, reply)) return; reply.hijack(); const r = reply.raw;
   r.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
   r.write('retry: 3000\n\n'); clients.add(r);
-  const t = setInterval(() => { try { r.write(': ping\n\n'); } catch {} }, 25000);
-  req.raw.on('close', () => { clearInterval(t); clients.delete(r); });
+  const t = setInterval(() => { try { r.write('data: __heartbeat__\n\n'); } catch {} }, 25000);
+  r.on('close', () => { clearInterval(t); clients.delete(r); });
 });
 
 /* files */
@@ -525,7 +581,7 @@ async function sweep() {
     if (!(od > 0 || idle >= 2) || (t.nudges || []).some(n => now - n.t < DAY)) continue;
     const why = [od > 0 && `Overdue ${od}d`, idle >= 2 && `No update ${Math.floor(idle)}d`].filter(Boolean).join(', ');
     const { id, ...rest } = t; await putDoc('todos', id, { ...rest, nudges: [...(t.nudges || []), { by: 'system', t: now, auto: 1 }].slice(-10) });
-    await inbox(t.to, `Auto-reminder: “${t.title}” needs an update (${why})`, t.pid);
+    await inbox(t.to, `Auto-reminder: “${t.title}” needs an update (${why})`, t.pid, 'system', 'note', { type: 'todo', id: t.id, pid: t.pid });
   }
   broadcast('todos');
 }

@@ -1,8 +1,8 @@
 # FollowUp — self-hosted Basecamp-style project & follow-up system
 
-Projects, to-dos (each with its own page), progress updates, message board, Campfire chat, automatic check-ins, schedule, card table, hill charts, files, DMs, bookmarks, search, project-scoped @mentions with autocomplete, reactions, Trash/restore, inbox, notifications, and admin user management.
+Projects, to-dos (each with its own page), progress updates, message board, Campfire chat, automatic check-ins, schedule, card table, hill charts, files, DMs, bookmarks, search, project-scoped @mentions with autocomplete, reactions, Trash/restore, inbox, notifications, and admin user management. Inbox DMs have searchable conversations, per-message timestamps and seen status, file attachments, and participant-controlled message deletion.
 
-The responsive workspace opens projects directly to their To-dos and named to-do lists. On phones, a persistent navigation dock keeps My Work, Projects, and Notifications within reach. Lists hold grouped assignments, due dates, comments, and reactions. Project Automatic Check-ins create individual daily, weekly, monthly, or one-time requests; recipients answer each request and discuss the answer in its own thread. Attachments are available on messages, comments, answers, inbox messages, and chat. Users can set their own profile picture, dark/light/system theme, and accent colour. Admin-managed job titles appear with profiles.
+The responsive workspace opens projects directly to their To-dos and named to-do lists. To-dos must belong to an explicit project list: create the list first, then add tasks inside it. On phones, a persistent navigation dock keeps My Work, Projects, and Notifications within reach. Lists hold grouped assignments, due dates, comments, and reactions. Project Automatic Check-ins create individual daily, weekly, monthly, or one-time requests; recipients answer each request and discuss the answer in its own thread. Attachments are available on messages, comments, answers, inbox messages, and chat. Users can set their own profile picture, dark/light/system theme, and accent colour. Admin-managed job titles appear with profiles.
 
 **This deployment enforces everything on the server**: logins, roles, private projects, DMs, invite codes and file access are checked by the backend, not the browser.
 
@@ -27,11 +27,18 @@ npm start                    # Node 20+; data is stored in ./data
 > **Windows tip:** Node 22.13+ uses its built-in SQLite by default; older Node versions use `better-sqlite3`. Force the built-in driver with `FORCE_NODE_SQLITE=1` on supported Node versions. Install from a short path such as `C:\followup`.
 
 ## 3. Deploy to Vercel
-1. Import this repository into Vercel with the `followup/` directory as the project root. The checked-in `public/index.html` is generated from the legacy UI; `npm run build` regenerates it.
-2. Add a Neon Postgres database and set `DATABASE_URL` to its pooled connection string.
-3. Connect a **private** Vercel Blob store (recommended: connect it to the project for OIDC credentials; a `BLOB_READ_WRITE_TOKEN` also works).
-4. Set a long random `CRON_SECRET` in Vercel. The configured Vercel Cron calls `/api/cron` every five minutes to process scheduled check-ins, reminders, and session expiry.
+1. Import the repository into Vercel. Set the project root to the directory containing `package.json` (leave it blank when that is the repository root). Use `npm run build` as the build command; leave the output directory unset. Vercel detects the Node.js Fastify server from `server.js`.
+2. Create a Neon Postgres database on its Free plan and add `DATABASE_URL` to Vercel using the pooled connection string.
+3. Create a **private** Vercel Blob store and add its `BLOB_READ_WRITE_TOKEN` to Vercel, or connect the store to the project for OIDC credentials.
+4. Generate a long random `CRON_SECRET` and add it as a Vercel environment variable.
 5. Deploy. Vercel deployments use secure cookies and polling for live UI updates; persistent data and attachments live in Postgres and private Blob storage. Local disk storage is not used on Vercel.
+6. To process scheduled check-ins, reminders, and session expiry every five minutes on Vercel Hobby, create a free job at [cron-job.org](https://cron-job.org/):
+   - URL: `https://YOUR-DEPLOYMENT.vercel.app/api/cron`
+   - Schedule: every 5 minutes
+   - Method: `GET`
+   - Custom header: `Authorization: Bearer YOUR_CRON_SECRET`
+
+   Replace the URL and secret with your deployment URL and the exact same `CRON_SECRET` value saved in Vercel. The endpoint rejects requests without this authorization header. The five-minute Vercel Cron in `vercel.json` is intentionally omitted because Vercel Hobby only permits daily cron schedules.
 
 Vercel's request-size limit means uploads are capped at 4 MB there (local installs default to 25 MB). The first account on an empty Neon database becomes the admin. This project cannot be deployed until the Vercel project, Neon database, and Blob store are connected and their environment variables are configured.
 
@@ -54,7 +61,7 @@ followup.example.com {
 
 ## 6. Notifications
 * In-app: bell, inbox, @mentions, CC, assignments, replies, completions, nudges, and scheduled check-ins — live via SSE.
-* **Automatic Check-ins:** open a project’s Check-ins tool, create a question, select the first local date/time, recurrence, and project members. Each occurrence creates a recipient-specific request that only the target can answer; answers and follow-up comments stay threaded on it.
+* **Automatic Check-ins:** open a project’s Check-ins tool, create a question, choose weekdays, weekly/every-other-week/monthly/one-time recurrence, set a local time, and select project members. The creator or an admin can edit a scheduled question and its schedule later; selecting a scheduled question opens its requests and answers. Each occurrence creates a recipient-specific request that only the target can answer. Answers show a **Discuss · Comments (n)** button; opening it takes you to that answer’s own discussion and comment composer. Writing areas for messages, comments, and answers include basic formatting, attachments, and project-scoped mentions.
 * `@TEAM` and individual mention suggestions are limited to members with access to the current project.
 * **Push to phones/desktops:** each user clicks **Enable alerts** once (HTTPS required; on iPhone, “Add to Home Screen” first). VAPID keys are generated automatically in `data/vapid.json`.
 * **Email:** set `SMTP_URL` + `MAIL_FROM`; every notification is also emailed (`EMAIL_NOTIFS=0` to turn off).
@@ -67,7 +74,7 @@ followup.example.com {
 | Auth | scrypt password hashes, HttpOnly SameSite cookie sessions (30 d), login/signup rate limiting, CSRF header required on writes |
 | Projects | visible only to creator, people granted access, and admins; to-dos, messages, chat, check-ins and files inherit this |
 | Roles | viewer = read-only; member = create/edit in projects they can see; admin = everything. Only admins change roles, settings, invites |
-| Inbox / DMs | only the recipient (inbox) or the two participants (DMs) can read; sender is stamped by the server and cannot be forged |
+| Inbox / DMs | only the recipient (inbox) or the two participants (DMs) can read; senders are server-stamped; recipients alone control read/seen status; senders or recipients can delete inbox items, and either DM participant can delete a message |
 | Files | stored on disk outside the web root, served only to users who can see the project; risky types forced to download |
 Known limits: inside a project any member can edit others’ items through the API (the UI restricts this to author/admin); no email verification or email-based password reset (admins reset passwords); the CSP allows inline scripts because the UI is a single file; single-node SQLite (good for hundreds of users, not thousands).
 

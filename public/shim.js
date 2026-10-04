@@ -10,21 +10,42 @@
     if (!r.ok) { const e = new Error(j.error || r.statusText); e.code = r.status; throw e; }
     return j;
   });
-  let ME = null, es = null, streamStarted = false;
+  let ME = null, es = null, streamStarted = false, pollTimer = null, lastStreamEvent = 0;
   const subs = new Map();
+  const refreshAll = () => new Set([...subs.values()].flatMap(a => [...a])).forEach(f => f());
+  const stopPolling = () => { if (pollTimer) clearInterval(pollTimer); pollTimer = null; };
+  const startPolling = () => {
+    if (pollTimer) return;
+    refreshAll();
+    pollTimer = setInterval(refreshAll, 5000);
+  };
   async function stream() {
     if (streamStarted) return;
     streamStarted = true;
     try {
       const { polling } = await J('GET', '/api/config');
       if (polling) {
-        setInterval(() => new Set([...subs.values()].flat()).forEach(f => f()), 5000);
+        startPolling();
         return;
       }
-    } catch (e) { streamStarted = false; return; }
+    } catch (e) { startPolling(); return; }
     es = new EventSource('/api/stream');
-    es.onmessage = ev => (subs.get(ev.data) || []).forEach(f => f());
+    es.onopen = () => {
+      lastStreamEvent = Date.now();
+      stopPolling();
+      refreshAll();
+    };
+    es.onmessage = ev => {
+      lastStreamEvent = Date.now();
+      if (ev.data === '__heartbeat__') return;
+      (subs.get(ev.data) || []).forEach(f => f());
+    };
+    es.onerror = () => startPolling();
+    setInterval(() => {
+      if (!document.hidden && lastStreamEvent && Date.now() - lastStreamEvent > 45000) startPolling();
+    }, 10000);
   }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshAll(); });
   class Snap {
     constructor(list, prev) {
       this.docs = list.map(o => { const { id, ...rest } = o; return { id, data: () => rest }; });
@@ -55,8 +76,8 @@
           busy = false; if (again) { again = false; run(); }
         };
         run(); stream();
-        const a = subs.get(col) || []; a.push(run); subs.set(col, a);
-        return () => { alive = false; };
+        const a = subs.get(col) || new Set(); a.add(run); subs.set(col, a);
+        return () => { alive = false; a.delete(run); if (!a.size) subs.delete(col); };
       },
     };
   }
