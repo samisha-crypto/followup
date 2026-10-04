@@ -1,0 +1,15 @@
+{
+  "buildCommand": "npm run build",
+  "functions": {
+    "server.js": {
+      "includeFiles": "public/**",
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
